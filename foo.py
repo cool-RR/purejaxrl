@@ -1,50 +1,65 @@
+from typing import Sequence, NamedTuple, Any
+
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
+import flax.linen
 import numpy as np
 import optax
-from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any
-from flax.training.train_state import TrainState
+import flax
+from flax.linen import initializers as flax_initializers
+import flax.training.train_state
 import distrax
 import gymnax
-from purejaxrl.wrappers import LogWrapper, FlattenObservationWrapper
+import purejaxrl.wrappers
 
 
-class ActorCritic(nn.Module):
+class ActorCritic(flax.linen.Module):
     action_dim: Sequence[int]
     activation: str = 'tanh'
 
-    @nn.compact
+    @flax.linen.compact
     def __call__(self, x):
         if self.activation == 'relu':
-            activation = nn.relu
+            activation = flax.linen.relu
         else:
-            activation = nn.tanh
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            activation = flax.linen.tanh
+        actor_mean = flax.linen.Dense(
+            64,
+            kernel_init=flax_initializers.orthogonal(np.sqrt(2)),
+            bias_init=flax_initializers.constant(0.0)
         )(x)
         actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        actor_mean = flax.linen.Dense(
+            64,
+            kernel_init=flax_initializers.orthogonal(np.sqrt(2)),
+            bias_init=flax_initializers.constant(0.0)
         )(actor_mean)
         actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        actor_mean = flax.linen.Dense(
+            self.action_dim,
+            kernel_init=flax_initializers.orthogonal(0.01),
+            bias_init=flax_initializers.constant(0.0)
         )(actor_mean)
         pi = distrax.Categorical(logits=actor_mean)
 
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        critic = flax.linen.Dense(
+            64,
+            kernel_init=flax_initializers.orthogonal(np.sqrt(2)),
+            bias_init=flax_initializers.constant(0.0),
         )(x)
         critic = activation(critic)
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        critic = flax.linen.Dense(
+            64,
+            kernel_init=flax_initializers.orthogonal(np.sqrt(2)),
+            bias_init=flax_initializers.constant(0.0)
         )(critic)
         critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        critic = flax.linen.Dense(
+            1,
+            kernel_init=flax_initializers.orthogonal(1.0),
+            bias_init=flax_initializers.constant(0.0)
+        )(critic)
+
 
         return pi, jnp.squeeze(critic, axis=-1)
 
@@ -67,8 +82,8 @@ def make_train(config):
         config['NUM_ENVS'] * config['NUM_STEPS'] // config['NUM_MINIBATCHES']
     )
     env, env_params = gymnax.make(config['ENV_NAME'])
-    env = FlattenObservationWrapper(env)
-    env = LogWrapper(env)
+    env = purejaxrl.wrappers.FlattenObservationWrapper(env)
+    env = purejaxrl.wrappers.LogWrapper(env)
 
     def linear_schedule(count):
         frac = (
@@ -96,7 +111,7 @@ def make_train(config):
                 optax.clip_by_global_norm(config['MAX_GRAD_NORM']),
                 optax.adam(config['LR'], eps=1e-5),
             )
-        train_state = TrainState.create(
+        train_state = flax.training.train_state.TrainState.create(
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
