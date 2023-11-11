@@ -131,8 +131,9 @@ def make_train(config):
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 pi, value = network.apply(train_state.params, last_obs)
-                action = pi.sample(seed=_rng)
-                log_prob = pi.log_prob(action)
+                action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
+                log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
+                jax.debug.breakpoint()
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -284,8 +285,8 @@ def make_train(config):
 
 
         rng, _rng = jax.random.split(rng)
-        jax.debug.breakpoint()
         runner_state = (train_state, env_state, obsv, _rng)
+        # jax.debug.breakpoint()
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config['NUM_UPDATES']
         )
@@ -302,7 +303,7 @@ if __name__ == '__main__':
         'LR': 2.5e-4,
         'NUM_ENVS': 4,
         'NUM_STEPS': 128,
-        'TOTAL_TIMESTEPS': 5e5,
+        'TOTAL_TIMESTEPS': 3e5,
         'UPDATE_EPOCHS': 4,
         'NUM_MINIBATCHES': 4,
         'GAMMA': 0.99,
