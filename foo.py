@@ -128,9 +128,6 @@ def make_train(config):
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, rng = runner_state
 
-                # jax.debug.breakpoint()
-                breakpoint()
-
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 pi, value = network.apply(train_state.params, last_obs)
@@ -188,7 +185,7 @@ def make_train(config):
                 def _update_minbatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
 
-                    def _loss_fn(params, traj_batch, gae, targets):
+                    def _loss_function(params, traj_batch, gae, targets):
                         # RERUN NETWORK
                         pi, value = network.apply(params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
@@ -226,12 +223,17 @@ def make_train(config):
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
-                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                    # End of _loss_function
+
+
+                    grad_fn = jax.value_and_grad(_loss_function, has_aux=True)
                     total_loss, grads = grad_fn(
                         train_state.params, traj_batch, advantages, targets
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
+
+                # End of _update_minbatch
 
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
@@ -258,6 +260,8 @@ def make_train(config):
                 )
                 update_state = (train_state, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
+            # End of _update_epoch
+
 
             update_state = (train_state, traj_batch, advantages, targets, rng)
             update_state, loss_info = jax.lax.scan(
@@ -276,13 +280,19 @@ def make_train(config):
 
             runner_state = (train_state, env_state, last_obs, rng)
             return runner_state, metric
+        # End of _update_step
+
 
         rng, _rng = jax.random.split(rng)
+        jax.debug.breakpoint()
         runner_state = (train_state, env_state, obsv, _rng)
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config['NUM_UPDATES']
         )
         return {'runner_state': runner_state, 'metrics': metric}
+
+    # End of train
+
 
     return train
 
