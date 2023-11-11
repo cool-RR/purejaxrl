@@ -183,7 +183,7 @@ def make_train(config):
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
+                def _update_minibatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
 
                     def _loss_function(params, traj_batch, gae, targets):
@@ -224,7 +224,7 @@ def make_train(config):
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
-                    # End of _loss_function
+                    # End of _loss_function, continuing _update_minibatch
 
 
                     grad_fn = jax.value_and_grad(_loss_function, has_aux=True)
@@ -234,7 +234,7 @@ def make_train(config):
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
 
-                # End of _update_minbatch
+                # End of _update_minibatch, continuing _update_epoch
 
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
@@ -257,11 +257,12 @@ def make_train(config):
                     shuffled_batch,
                 )
                 train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                    _update_minibatch, train_state, minibatches
                 )
                 update_state = (train_state, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
-            # End of _update_epoch
+
+            # End of _update_epoch, continuing _update_step
 
 
             update_state = (train_state, traj_batch, advantages, targets, rng)
@@ -281,7 +282,7 @@ def make_train(config):
 
             runner_state = (train_state, env_state, last_obs, rng)
             return runner_state, metric
-        # End of _update_step
+        # End of _update_step, continuing train
 
 
         rng, _rng = jax.random.split(rng)
@@ -292,8 +293,7 @@ def make_train(config):
         )
         return {'runner_state': runner_state, 'metrics': metric}
 
-    # End of train
-
+    # End of train, continuing make_train
 
     return train
 
