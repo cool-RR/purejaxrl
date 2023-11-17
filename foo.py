@@ -87,7 +87,7 @@ class RunnerState:
 @flax.struct.dataclass
 class UpdateState:
     train_state: flax.training.train_state.TrainState
-    traj_batch: Transition # It's actually a stacked transition
+    batched_transition: Transition # It's actually a stacked transition
     advantages: jnp.ndarray
     targets: jnp.ndarray
     rng: jax.random.PRNGKey
@@ -171,16 +171,16 @@ class LinearSchedule:
         return self.lr * frac
 
 
-def loss_function(actor_critic: ActorCritic, params: dict, traj_batch: Transition,
+def loss_function(actor_critic: ActorCritic, params: dict, batched_transition: Transition,
                   gae: jnp.ndarray, targets: jnp.ndarray
                   ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
     # Rerun actor_critic
-    pi, value = actor_critic.apply(params, traj_batch.obs)
-    log_prob = pi.log_prob(traj_batch.action)
+    pi, value = actor_critic.apply(params, batched_transition.obs)
+    log_prob = pi.log_prob(batched_transition.action)
 
     # calculate value loss
-    value_pred_clipped = traj_batch.value + (
-        value - traj_batch.value
+    value_pred_clipped = batched_transition.value + (
+        value - batched_transition.value
     ).clip(-foo_config.clip_eps, foo_config.clip_eps)
     value_losses = jnp.square(value - targets)
     value_losses_clipped = jnp.square(value_pred_clipped - targets)
@@ -189,7 +189,7 @@ def loss_function(actor_critic: ActorCritic, params: dict, traj_batch: Transitio
     )
 
     # Calculate actor loss
-    ratio = jnp.exp(log_prob - traj_batch.log_prob)
+    ratio = jnp.exp(log_prob - batched_transition.log_prob)
     gae = (gae - gae.mean()) / (gae.std() + 1e-8)
     loss_actor1 = ratio * gae
     loss_actor2 = (
@@ -212,8 +212,10 @@ def loss_function(actor_critic: ActorCritic, params: dict, traj_batch: Transitio
     return total_loss, (value_loss, loss_actor, entropy)
 
 
-def calculate_gae(traj_batch, last_val):
-    def get_advantages(gae_and_next_value, transition):
+def calculate_gae(batched_transition: Transition, last_val: jnp.ndarray) -> tuple[jnp.ndarray,
+                                                                                  jnp.ndarray]:
+    def get_advantages(gae_and_next_value: tuple[jnp.ndarray, jnp.ndarray], transition: Transition
+                       ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
         gae, next_value = gae_and_next_value
         done, value, reward = (
             transition.done,
@@ -230,11 +232,11 @@ def calculate_gae(traj_batch, last_val):
     _, advantages = jax.lax.scan(
         get_advantages,
         (jnp.zeros_like(last_val), last_val),
-        traj_batch,
+        batched_transition,
         reverse=True,
         unroll=16,
     )
-    return advantages, advantages + traj_batch.value
+    return advantages, advantages + batched_transition.value
 
 
 def make_train(foo_config: FooConfig):
@@ -243,15 +245,10 @@ def make_train(foo_config: FooConfig):
     env = purejaxrl.wrappers.LogWrapper(env)
 
     def train(rng: jax.random.PRNGKey) -> tuple[RunnerState, dict]:
-        '''
-        return runner_state, metric
-        '''
-        # Init actor_critic
-        rng = foo_config.rng
         actor_critic = ActorCritic(
             env.action_space(env_params).n, activation=foo_config.activation
         )
-        rng, _rng = jax.random.split(rng)
+        rng, _rng = jax.random.split(foo_config.rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
         actor_critic_params = actor_critic.init(_rng, init_x)
         if foo_config.anneal_lr:
@@ -275,16 +272,15 @@ def make_train(foo_config: FooConfig):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
         # Train loop
-        def _update_step(runner_state: RunnerState, unused: None):
+        def update_step(runner_state: RunnerState, unused: None):
             # Collect trajectories
-            def _env_step(runner_state: runner_state, unused: None) -> tuple[RunnerState,
+            def env_step(runner_state: runner_state, unused: None) -> tuple[RunnerState,
                                                                              Transition]:
                 # Select action
                 rng, _rng = jax.random.split(runner_state.rng)
                 pi, value = actor_critic.apply(runner_state.train_state.params, runner_state.last_obs)
                 action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
                 log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
-                # breakpoint()
 
                 # Step env
                 rng, _rng = jax.random.split(rng)
@@ -301,8 +297,8 @@ def make_train(foo_config: FooConfig):
                     transition,
                 )
 
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, foo_config.num_steps
+            runner_state, batched_transition = jax.lax.scan(
+                env_step, runner_state, None, foo_config.num_steps
             )
 
 
@@ -310,17 +306,17 @@ def make_train(foo_config: FooConfig):
             _, last_val = actor_critic.apply(runner_state.train_state.params, runner_state.last_obs)
 
 
-            advantages, targets = calculate_gae(traj_batch, last_val)
+            advantages, targets = calculate_gae(batched_transition, last_val)
 
             # Update actor_critic
-            def _update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
-                def _update_minibatch(train_state, batch_info):
-                    traj_batch, advantages, targets = batch_info
+            def update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
+                def update_minibatch(train_state, batch_info):
+                    batched_transition, advantages, targets = batch_info
 
                     grad_fn = jax.value_and_grad(lambda *args: loss_function(actor_critic, *args),
                                                  has_aux=True)
                     total_loss, grads = grad_fn(
-                        train_state.params, traj_batch, advantages, targets
+                        train_state.params, batched_transition, advantages, targets
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
@@ -333,7 +329,8 @@ def make_train(foo_config: FooConfig):
                     batch_size == foo_config.num_steps * foo_config.num_envs
                 ), 'batch size must be equal to number of steps * number of envs'
                 permutation = jax.random.permutation(_rng, batch_size)
-                batch = (update_state.traj_batch, update_state.advantages, update_state.targets)
+                batch = (update_state.batched_transition, update_state.advantages,
+                         update_state.targets)
                 batch = jax.tree_util.tree_map(
                     lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
                 )
@@ -347,10 +344,11 @@ def make_train(foo_config: FooConfig):
                     shuffled_batch,
                 )
                 train_state, total_loss = jax.lax.scan(
-                    _update_minibatch, update_state.train_state, minibatches
+                    update_minibatch, update_state.train_state, minibatches
                 )
                 return (
-                    UpdateState(train_state=train_state, traj_batch=update_state.traj_batch,
+                    UpdateState(train_state=train_state,
+                                batched_transition=update_state.batched_transition,
                                 advantages=update_state.advantages, targets=update_state.targets,
                                 rng=rng),
                     total_loss
@@ -359,12 +357,13 @@ def make_train(foo_config: FooConfig):
             # End of _update_epoch, continuing _update_step
 
 
-            update_state = UpdateState(train_state=runner_state.train_state, traj_batch=traj_batch,
+            update_state = UpdateState(train_state=runner_state.train_state,
+                                       batched_transition=batched_transition,
                                        advantages=advantages, targets=targets, rng=runner_state.rng)
             update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, foo_config.update_epochs
+                update_epoch, update_state, None, foo_config.update_epochs
             )
-            metric = traj_batch.info
+            metric = batched_transition.info
             if foo_config.debug:
                 def callback(info):
                     return_values = info['returned_episode_returns'][info['returned_episode']]
@@ -385,9 +384,8 @@ def make_train(foo_config: FooConfig):
         rng, _rng = jax.random.split(rng)
         runner_state = RunnerState(train_state=train_state, env_state=env_state, last_obs=obsv,
                                    rng=_rng)
-        # breakpoint()
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, foo_config.num_updates
+            update_step, runner_state, None, foo_config.num_updates
         )
         return {'runner_state': runner_state, 'metrics': metric}
 
