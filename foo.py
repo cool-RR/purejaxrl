@@ -1,5 +1,8 @@
-from typing import Sequence, NamedTuple, Any
+from __future__ import annotations
+
+from typing import Sequence, NamedTuple, Any, TypeVar
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +15,49 @@ import flax.training.train_state
 import distrax
 import gymnax
 import purejaxrl.wrappers
+
+RealNumber = int | float
+EnvState = TypeVar('EnvState')
+
+@dataclasses.dataclass(kw_only=True, repr=False)
+class FooConfig:
+    lr: float = 2.5e-4
+    num_envs: int = 4
+    num_steps: int = 128
+    total_timesteps: float = 3e5
+    update_epochs: int = 4
+    num_minibatches: int = 4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_eps: float = 0.2
+    ent_coef: float = 0.01
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    activation: str = 'tanh'
+    env_name: str = 'CartPole-v1'
+    anneal_lr: bool = True
+    debug: bool = True
+    rng_key: int = 30
+
+    def __post_init__(self) -> None:
+        self.rng = jax.random.PRNGKey(self.rng_key)
+
+
+    def __hash__(self) -> int:
+        return hash(
+            (type(self),
+             *(getattr(self, field) for field in self.__dataclass_fields__))
+        )
+
+
+@flax.struct.dataclass
+class RunnerState:
+    train_state: flax.training.train_state.TrainState
+    env_state: EnvState
+    last_obs: jnp.ndarray
+    rng: jax.random.PRNGKey
+
+
 
 
 class ActorCritic(flax.linen.Module):
@@ -75,7 +121,7 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
-def make_train(foo_config):
+def make_train(foo_config: FooConfig):
     foo_config.num_updates = (
         foo_config.total_timesteps // foo_config.num_steps // foo_config.num_envs
     )
@@ -86,7 +132,7 @@ def make_train(foo_config):
     env = purejaxrl.wrappers.FlattenObservationWrapper(env)
     env = purejaxrl.wrappers.LogWrapper(env)
 
-    def linear_schedule(count):
+    def linear_schedule(count: int) -> RealNumber:
         frac = (
             1.0
             - (count // (foo_config.num_minibatches * foo_config.update_epochs))
@@ -94,8 +140,12 @@ def make_train(foo_config):
         )
         return foo_config.lr * frac
 
-    def train(rng):
+    def train(rng: jax.random.PRNGKey) -> tuple[RunnerState, dict]:
+        '''
+        return runner_state, metric
+        '''
         # Init network
+        rng = foo_config.rng
         network = ActorCritic(
             env.action_space(env_params).n, activation=foo_config.activation
         )
@@ -123,37 +173,38 @@ def make_train(foo_config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
         # Train loop
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state: RunnerState, unused: None):
             # Collect trajectories
-            def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, rng = runner_state
-
+            def _env_step(runner_state: runner_state, unused: None) -> tuple[RunnerState,
+                                                                             Transition]:
                 # Select action
-                rng, _rng = jax.random.split(rng)
-                pi, value = network.apply(train_state.params, last_obs)
+                rng, _rng = jax.random.split(runner_state.rng)
+                pi, value = network.apply(runner_state.train_state.params, runner_state.last_obs)
                 action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
                 log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
-                jax.debug.breakpoint()
+                # jax.debug.breakpoint()
 
                 # Step env
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, foo_config.num_envs)
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, env_params)
+                )(rng_step, runner_state.env_state, action, env_params)
                 transition = Transition(
-                    done, action, value, reward, log_prob, last_obs, info
+                    done, action, value, reward, log_prob, runner_state.last_obs, info
                 )
-                runner_state = (train_state, env_state, obsv, rng)
-                return runner_state, transition
+                return (
+                    RunnerState(train_state=runner_state.train_state, env_state=env_state,
+                                last_obs=obsv, rng=rng),
+                    transition,
+                )
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, foo_config.num_steps
             )
 
             # Calculate advantage
-            train_state, env_state, last_obs, rng = runner_state
-            _, last_val = network.apply(train_state.params, last_obs)
+            _, last_val = network.apply(runner_state.train_state.params, runner_state.last_obs)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -265,14 +316,15 @@ def make_train(foo_config):
             # End of _update_epoch, continuing _update_step
 
 
-            update_state = (train_state, traj_batch, advantages, targets, rng)
+            update_state = (runner_state.train_state, traj_batch, advantages, targets,
+                            runner_state.rng)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, foo_config.update_epochs
             )
             train_state = update_state[0]
             metric = traj_batch.info
             rng = update_state[-1]
-            if foo_config.get('DEBUG'):
+            if foo_config.debug:
                 def callback(info):
                     return_values = info['returned_episode_returns'][info['returned_episode']]
                     timesteps = info['timestep'][info['returned_episode']] * foo_config.num_envs
@@ -280,13 +332,18 @@ def make_train(foo_config):
                         print(f'global step={timesteps[t]}, episodic return={return_values[t]}')
                 jax.debug.callback(callback, metric)
 
-            runner_state = (train_state, env_state, last_obs, rng)
-            return runner_state, metric
+            return (
+                RunnerState(
+                    train_state=train_state, env_state=runner_state.env_state,
+                    last_obs=runner_state.last_obs, rng=runner_state.rng),
+                metric,
+            )
+
         # End of _update_step, continuing train
 
-
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng)
+        runner_state = RunnerState(train_state=train_state, env_state=env_state, last_obs=obsv,
+                                   rng=_rng)
         # jax.debug.breakpoint()
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, foo_config.num_updates
@@ -299,36 +356,7 @@ def make_train(foo_config):
 
 
 
-@dataclasses.dataclass(kw_only=True, repr=False)
-class FooConfig:
-    lr: float = 2.5e-4
-    num_envs: int = 4
-    num_steps: int = 128
-    total_timesteps: float = 3e5
-    update_epochs: int = 4
-    num_minibatches: int = 4
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_eps: float = 0.2
-    ent_coef: float = 0.01
-    vf_coef: float = 0.5
-    max_grad_norm: float = 0.5
-    activation: str = 'tanh'
-    env_name: str = 'CartPole-v1'
-    anneal_lr: bool = True
-    debug: bool = True
-
-
-    def __hash__(self) -> int:
-        return hash(
-            (type(self),
-             *(getattr(self, field) for field in self.__dataclass_fields__))
-        )
-
-
-
 if __name__ == '__main__':
     foo_config = FooConfig()
-    rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(foo_config))
-    out = train_jit(rng)
+    out = train_jit(foo_config.rng)
