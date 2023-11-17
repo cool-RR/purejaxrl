@@ -217,7 +217,7 @@ def calculate_gae(batched_transition: Transition, last_val: jnp.ndarray) -> tupl
                                                                                   jnp.ndarray]:
     def get_advantages(gae_and_next_value: tuple[jnp.ndarray, jnp.ndarray], transition: Transition
                        ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-        gae, next_value = gae_and_next_value
+        next_gae, next_value = gae_and_next_value
         done, value, reward = (
             transition.done,
             transition.value,
@@ -225,8 +225,8 @@ def calculate_gae(batched_transition: Transition, last_val: jnp.ndarray) -> tupl
         )
         delta = reward + foo_config.gamma * next_value * (1 - done) - value
         gae = (
-            delta
-            + foo_config.gamma * foo_config.gae_lambda * (1 - done) * gae
+            delta +
+            foo_config.gamma * foo_config.gae_lambda * (1 - done) * next_gae
         )
         return (gae, value), gae
 
