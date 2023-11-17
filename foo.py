@@ -23,15 +23,33 @@ EnvState = TypeVar('EnvState') # This is a different class for each environment,
 sys.breakpointhook = jax.debug.breakpoint
 
 
-# @dataclasses.dataclass(kw_only=True, repr=False)
 @flax.struct.dataclass
 class FooConfig:
-    lr: float = 2.5e-4
-    num_envs: int = 4
-    num_steps: int = 128
+
+    ### Defining various integers that determine how much training we'll do: #######################
+    #                                                                                              #
+    n_envs: int = 4
+    n_steps: int = 128
     total_timesteps: float = 3e5
     n_epochs_per_aeon: int = 4
-    num_minibatches: int = 4
+    n_minibatches: int = 4
+
+    @property
+    @functools.cache
+    def n_aeons(self) -> int:
+        return self.total_timesteps // self.n_steps // self.n_envs
+
+    @property
+    @functools.cache
+    def minibatch_size(self) -> int:
+        return self.n_envs * self.n_steps // self.n_minibatches
+    #                                                                                              #
+    ### Finished defining various integers that determine how much training we'll do. ##############
+
+
+    ### Defining training parameters: ##############################################################
+    #                                                                                              #
+    lr: float = 2.5e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
@@ -39,8 +57,11 @@ class FooConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     activation: str = 'tanh'
-    env_name: str = 'CartPole-v1'
     anneal_lr: bool = True
+    #                                                                                              #
+    ### Finished defining training parameters. #####################################################
+
+    env_name: str = 'CartPole-v1'
     debug: bool = True
     rng_key: int = 30
 
@@ -48,17 +69,6 @@ class FooConfig:
     @functools.cache
     def rng(self) -> jax.random.PRNGKey:
         return jax.random.PRNGKey(self.rng_key)
-
-    @property
-    @functools.cache
-    def n_aeons(self) -> int:
-        return self.total_timesteps // self.num_steps // self.num_envs
-
-    @property
-    @functools.cache
-    def minibatch_size(self) -> int:
-        return self.num_envs * self.num_steps // self.num_minibatches
-
 
     def __hash__(self) -> int:
         return hash(
@@ -148,7 +158,7 @@ class ActorCritic(flax.linen.Module):
 
 @flax.struct.dataclass
 class LinearSchedule:
-    num_minibatches: int
+    n_minibatches: int
     n_epochs_per_aeon: int
     n_aeons: int
     lr: float
@@ -156,7 +166,7 @@ class LinearSchedule:
     @staticmethod
     def from_foo_config(foo_config: FooConfig) -> LinearSchedule:
         return LinearSchedule(
-            num_minibatches=foo_config.num_minibatches,
+            n_minibatches=foo_config.n_minibatches,
             n_epochs_per_aeon=foo_config.n_epochs_per_aeon,
             n_aeons=foo_config.n_aeons,
             lr=foo_config.lr,
@@ -166,7 +176,7 @@ class LinearSchedule:
     def __call__(self, count: int) -> RealNumber:
         frac = (
             1.0
-            - (count // (self.num_minibatches * self.n_epochs_per_aeon))
+            - (count // (self.n_minibatches * self.n_epochs_per_aeon))
             / self.n_aeons
         )
         return self.lr * frac
@@ -260,7 +270,7 @@ class Trainer:
 
             # Step env
             rng, _rng = jax.random.split(rng)
-            rng_step = jax.random.split(_rng, foo_config.num_envs)
+            rng_step = jax.random.split(_rng, foo_config.n_envs)
             obsv, env_state, reward, done, info = jax.vmap(
                 self.env.step, in_axes=(0, 0, 0, None)
             )(rng_step, runner_state.env_state, action, self.env_params)
@@ -274,7 +284,7 @@ class Trainer:
             )
 
         runner_state, batched_transition = jax.lax.scan(
-            env_step, runner_state, None, foo_config.num_steps
+            env_step, runner_state, None, foo_config.n_steps
         )
 
 
@@ -300,9 +310,9 @@ class Trainer:
                 return train_state, total_loss
 
             rng, _rng = jax.random.split(update_state.rng)
-            batch_size = foo_config.minibatch_size * foo_config.num_minibatches
+            batch_size = foo_config.minibatch_size * foo_config.n_minibatches
             assert (
-                batch_size == foo_config.num_steps * foo_config.num_envs
+                batch_size == foo_config.n_steps * foo_config.n_envs
             ), 'batch size must be equal to number of steps * number of envs'
             permutation = jax.random.permutation(_rng, batch_size)
             batch = (update_state.batched_transition, update_state.advantages,
@@ -315,7 +325,7 @@ class Trainer:
             )
             minibatches = jax.tree_util.tree_map(
                 lambda x: jnp.reshape(
-                    x, [foo_config.num_minibatches, -1] + list(x.shape[1:])
+                    x, [foo_config.n_minibatches, -1] + list(x.shape[1:])
                 ),
                 shuffled_batch,
             )
@@ -343,7 +353,7 @@ class Trainer:
         if foo_config.debug:
             def callback(info):
                 return_values = info['returned_episode_returns'][info['returned_episode']]
-                timesteps = info['timestep'][info['returned_episode']] * foo_config.num_envs
+                timesteps = info['timestep'][info['returned_episode']] * foo_config.n_envs
                 for t in range(len(timesteps)):
                     print(f'global step={timesteps[t]}, episodic return={return_values[t]}')
             jax.debug.callback(callback, metric)
@@ -378,7 +388,7 @@ class Trainer:
         )
 
         rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, foo_config.num_envs)
+        reset_rng = jax.random.split(_rng, foo_config.n_envs)
         obsv, env_state = jax.vmap(self.env.reset, in_axes=(0, None))(reset_rng, self.env_params)
 
         rng, _rng = jax.random.split(rng)
