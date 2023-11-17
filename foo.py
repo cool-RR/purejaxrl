@@ -41,6 +41,11 @@ class FooConfig:
 
     @property
     @functools.cache
+    def batch_size(self) -> int:
+        return self.minibatch_size * self.n_minibatches
+
+    @property
+    @functools.cache
     def minibatch_size(self) -> int:
         return self.n_envs * self.n_steps // self.n_minibatches
     #                                                                                              #
@@ -69,6 +74,10 @@ class FooConfig:
     @functools.cache
     def rng(self) -> jax.random.PRNGKey:
         return jax.random.PRNGKey(self.rng_key)
+
+    def __post_init__(self):
+        assert self.batch_size == self.n_steps * self.n_envs
+
 
     def __hash__(self) -> int:
         return hash(
@@ -310,15 +319,11 @@ class Trainer:
                 return train_state, total_loss
 
             rng, _rng = jax.random.split(update_state.rng)
-            batch_size = foo_config.minibatch_size * foo_config.n_minibatches
-            assert (
-                batch_size == foo_config.n_steps * foo_config.n_envs
-            ), 'batch size must be equal to number of steps * number of envs'
-            permutation = jax.random.permutation(_rng, batch_size)
+            permutation = jax.random.permutation(_rng, foo_config.batch_size)
             batch = (update_state.batched_transition, update_state.advantages,
                      update_state.targets)
             batch = jax.tree_util.tree_map(
-                lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                lambda x: x.reshape((foo_config.batch_size,) + x.shape[2:]), batch
             )
             shuffled_batch = jax.tree_util.tree_map(
                 lambda x: jnp.take(x, permutation, axis=0), batch
