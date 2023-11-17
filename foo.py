@@ -250,6 +250,120 @@ class Trainer:
             self.env.action_space(self.env_params).n, activation=foo_config.activation
         )
 
+
+    def _update_step(self, runner_state: RunnerState, unused: None):
+        # Collect trajectories
+        def env_step(runner_state: runner_state, unused: None) -> tuple[RunnerState,
+                                                                         Transition]:
+            # Select action
+            rng, _rng = jax.random.split(runner_state.rng)
+            pi, value = self.actor_critic.apply(runner_state.train_state.params,
+                                                runner_state.last_obs)
+            action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
+            log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
+
+            # Step env
+            rng, _rng = jax.random.split(rng)
+            rng_step = jax.random.split(_rng, foo_config.num_envs)
+            obsv, env_state, reward, done, info = jax.vmap(
+                self.env.step, in_axes=(0, 0, 0, None)
+            )(rng_step, runner_state.env_state, action, self.env_params)
+            transition = Transition(
+                done, action, value, reward, log_prob, runner_state.last_obs, info
+            )
+            return (
+                RunnerState(train_state=runner_state.train_state, env_state=env_state,
+                            last_obs=obsv, rng=rng),
+                transition,
+            )
+
+        runner_state, batched_transition = jax.lax.scan(
+            env_step, runner_state, None, foo_config.num_steps
+        )
+
+
+        # Calculate advantage
+        _, last_val = self.actor_critic.apply(runner_state.train_state.params,
+                                              runner_state.last_obs)
+
+
+        advantages, targets = calculate_gae(batched_transition, last_val)
+
+        # Update self.actor_critic
+        def update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
+            def update_minibatch(train_state, batch_info):
+                batched_transition, advantages, targets = batch_info
+
+                grad_fn = jax.value_and_grad(
+                    lambda *args: loss_function(self.actor_critic, *args),
+                    has_aux=True
+                )
+                total_loss, grads = grad_fn(
+                    train_state.params, batched_transition, advantages, targets
+                )
+                train_state = train_state.apply_gradients(grads=grads)
+                return train_state, total_loss
+
+            # End of _update_minibatch, continuing _update_epoch
+
+            rng, _rng = jax.random.split(update_state.rng)
+            batch_size = foo_config.minibatch_size * foo_config.num_minibatches
+            assert (
+                batch_size == foo_config.num_steps * foo_config.num_envs
+            ), 'batch size must be equal to number of steps * number of envs'
+            permutation = jax.random.permutation(_rng, batch_size)
+            batch = (update_state.batched_transition, update_state.advantages,
+                     update_state.targets)
+            batch = jax.tree_util.tree_map(
+                lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+            )
+            shuffled_batch = jax.tree_util.tree_map(
+                lambda x: jnp.take(x, permutation, axis=0), batch
+            )
+            minibatches = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(
+                    x, [foo_config.num_minibatches, -1] + list(x.shape[1:])
+                ),
+                shuffled_batch,
+            )
+            train_state, total_loss = jax.lax.scan(
+                update_minibatch, update_state.train_state, minibatches
+            )
+            return (
+                UpdateState(train_state=train_state,
+                            batched_transition=update_state.batched_transition,
+                            advantages=update_state.advantages, targets=update_state.targets,
+                            rng=rng),
+                total_loss
+            )
+
+        # End of _update_epoch, continuing _update_step
+
+
+        update_state = UpdateState(train_state=runner_state.train_state,
+                                   batched_transition=batched_transition,
+                                   advantages=advantages, targets=targets, rng=runner_state.rng)
+        update_state, loss_info = jax.lax.scan(
+            update_epoch, update_state, None, foo_config.update_epochs
+        )
+        metric = batched_transition.info
+        if foo_config.debug:
+            def callback(info):
+                return_values = info['returned_episode_returns'][info['returned_episode']]
+                timesteps = info['timestep'][info['returned_episode']] * foo_config.num_envs
+                for t in range(len(timesteps)):
+                    print(f'global step={timesteps[t]}, episodic return={return_values[t]}')
+            jax.debug.callback(callback, metric)
+
+        return (
+            RunnerState(
+                train_state=update_state.train_state, env_state=runner_state.env_state,
+                last_obs=runner_state.last_obs, rng=update_state.rng),
+            metric,
+        )
+
+
+
     def __call__(self):
         rng, _rng = jax.random.split(self.foo_config.rng)
         init_x = jnp.zeros(self.env.observation_space(self.env_params).shape)
@@ -274,127 +388,11 @@ class Trainer:
         reset_rng = jax.random.split(_rng, foo_config.num_envs)
         obsv, env_state = jax.vmap(self.env.reset, in_axes=(0, None))(reset_rng, self.env_params)
 
-        # Train loop
-        def update_step(runner_state: RunnerState, unused: None):
-            # Collect trajectories
-            def env_step(runner_state: runner_state, unused: None) -> tuple[RunnerState,
-                                                                             Transition]:
-                # Select action
-                rng, _rng = jax.random.split(runner_state.rng)
-                pi, value = self.actor_critic.apply(runner_state.train_state.params,
-                                                    runner_state.last_obs)
-                action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
-                log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
-
-                # Step env
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, foo_config.num_envs)
-                obsv, env_state, reward, done, info = jax.vmap(
-                    self.env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, runner_state.env_state, action, self.env_params)
-                transition = Transition(
-                    done, action, value, reward, log_prob, runner_state.last_obs, info
-                )
-                return (
-                    RunnerState(train_state=runner_state.train_state, env_state=env_state,
-                                last_obs=obsv, rng=rng),
-                    transition,
-                )
-
-            runner_state, batched_transition = jax.lax.scan(
-                env_step, runner_state, None, foo_config.num_steps
-            )
-
-
-            # Calculate advantage
-            _, last_val = self.actor_critic.apply(runner_state.train_state.params,
-                                                  runner_state.last_obs)
-
-
-            advantages, targets = calculate_gae(batched_transition, last_val)
-
-            # Update self.actor_critic
-            def update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
-                def update_minibatch(train_state, batch_info):
-                    batched_transition, advantages, targets = batch_info
-
-                    grad_fn = jax.value_and_grad(
-                        lambda *args: loss_function(self.actor_critic, *args),
-                        has_aux=True
-                    )
-                    total_loss, grads = grad_fn(
-                        train_state.params, batched_transition, advantages, targets
-                    )
-                    train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
-
-                # End of _update_minibatch, continuing _update_epoch
-
-                rng, _rng = jax.random.split(update_state.rng)
-                batch_size = foo_config.minibatch_size * foo_config.num_minibatches
-                assert (
-                    batch_size == foo_config.num_steps * foo_config.num_envs
-                ), 'batch size must be equal to number of steps * number of envs'
-                permutation = jax.random.permutation(_rng, batch_size)
-                batch = (update_state.batched_transition, update_state.advantages,
-                         update_state.targets)
-                batch = jax.tree_util.tree_map(
-                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
-                )
-                shuffled_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.take(x, permutation, axis=0), batch
-                )
-                minibatches = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(
-                        x, [foo_config.num_minibatches, -1] + list(x.shape[1:])
-                    ),
-                    shuffled_batch,
-                )
-                train_state, total_loss = jax.lax.scan(
-                    update_minibatch, update_state.train_state, minibatches
-                )
-                return (
-                    UpdateState(train_state=train_state,
-                                batched_transition=update_state.batched_transition,
-                                advantages=update_state.advantages, targets=update_state.targets,
-                                rng=rng),
-                    total_loss
-                )
-
-            # End of _update_epoch, continuing _update_step
-
-
-            update_state = UpdateState(train_state=runner_state.train_state,
-                                       batched_transition=batched_transition,
-                                       advantages=advantages, targets=targets, rng=runner_state.rng)
-            update_state, loss_info = jax.lax.scan(
-                update_epoch, update_state, None, foo_config.update_epochs
-            )
-            metric = batched_transition.info
-            if foo_config.debug:
-                def callback(info):
-                    return_values = info['returned_episode_returns'][info['returned_episode']]
-                    timesteps = info['timestep'][info['returned_episode']] * foo_config.num_envs
-                    for t in range(len(timesteps)):
-                        print(f'global step={timesteps[t]}, episodic return={return_values[t]}')
-                jax.debug.callback(callback, metric)
-
-            return (
-                RunnerState(
-                    train_state=update_state.train_state, env_state=runner_state.env_state,
-                    last_obs=runner_state.last_obs, rng=update_state.rng),
-                metric,
-            )
-
-
-
-
-
         rng, _rng = jax.random.split(rng)
         runner_state = RunnerState(train_state=train_state, env_state=env_state, last_obs=obsv,
                                    rng=_rng)
         runner_state, metric = jax.lax.scan(
-            update_step, runner_state, None, foo_config.num_updates
+            self._update_step, runner_state, None, foo_config.num_updates
         )
         return {'runner_state': runner_state, 'metrics': metric}
 
