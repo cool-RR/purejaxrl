@@ -219,8 +219,8 @@ def make_train(foo_config):
 
                         total_loss = (
                             loss_actor
-                            + foo_config.VF_COEF * value_loss
-                            - foo_config.ENT_COEF * entropy
+                            + foo_config.vf_coef * value_loss
+                            - foo_config.ent_coef * entropy
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
@@ -238,9 +238,9 @@ def make_train(foo_config):
 
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
-                batch_size = foo_config.MINIBATCH_SIZE * foo_config.NUM_MINIBATCHES
+                batch_size = foo_config.minibatch_size * foo_config.num_minibatches
                 assert (
-                    batch_size == foo_config.NUM_STEPS * foo_config.NUM_ENVS
+                    batch_size == foo_config.num_steps * foo_config.num_envs
                 ), 'batch size must be equal to number of steps * number of envs'
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
@@ -252,7 +252,7 @@ def make_train(foo_config):
                 )
                 minibatches = jax.tree_util.tree_map(
                     lambda x: jnp.reshape(
-                        x, [foo_config.NUM_MINIBATCHES, -1] + list(x.shape[1:])
+                        x, [foo_config.num_minibatches, -1] + list(x.shape[1:])
                     ),
                     shuffled_batch,
                 )
@@ -267,7 +267,7 @@ def make_train(foo_config):
 
             update_state = (train_state, traj_batch, advantages, targets, rng)
             update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, foo_config.UPDATE_EPOCHS
+                _update_epoch, update_state, None, foo_config.update_epochs
             )
             train_state = update_state[0]
             metric = traj_batch.info
@@ -275,7 +275,7 @@ def make_train(foo_config):
             if foo_config.get('DEBUG'):
                 def callback(info):
                     return_values = info['returned_episode_returns'][info['returned_episode']]
-                    timesteps = info['timestep'][info['returned_episode']] * foo_config.NUM_ENVS
+                    timesteps = info['timestep'][info['returned_episode']] * foo_config.num_envs
                     for t in range(len(timesteps)):
                         print(f'global step={timesteps[t]}, episodic return={return_values[t]}')
                 jax.debug.callback(callback, metric)
@@ -289,7 +289,7 @@ def make_train(foo_config):
         runner_state = (train_state, env_state, obsv, _rng)
         # jax.debug.breakpoint()
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, foo_config.NUM_UPDATES
+            _update_step, runner_state, None, foo_config.num_updates
         )
         return {'runner_state': runner_state, 'metrics': metric}
 
