@@ -96,13 +96,16 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
+@flax.struct.dataclass
+class TransitionCarry:
+    env_state: EnvState
+    last_observation: jnp.ndarray
+    rng: jax.random.PRNGKey
 
 
 @flax.struct.dataclass
 class AeonCarry:
     train_state: flax.training.train_state.TrainState
-    env_state: EnvState
-    last_obs: jnp.ndarray
     rng: jax.random.PRNGKey
 
 
@@ -267,42 +270,70 @@ class Trainer:
             self.env.action_space(self.env_params).n, activation=foo_config.activation
         )
 
+    def _vmapped_reset(self, reset_rngs, env_params):
+        '''
+        returns `obs, env_state`
+        '''
+        return jax.vmap(self.env.reset, in_axes=(0, None))(reset_rngs, env_params)
 
-    def train_aeon(self, aeon_carry: AeonCarry, unused: None) -> tuple[AeonCarry, dict]:
-        # Collect trajectories
-        def make_transition(aeon_carry: aeon_carry, unused: None) -> tuple[AeonCarry,
-                                                                    Transition]:
+
+    def make_transitions(self,
+                         rng: jax.random.PRNGKey,
+                         train_state: flax.training.train_state.TrainState
+                         ) -> tuple[jnp.ndarray, Transition]:
+
+        def make_transition(transition_carry: TransitionCarry, unused: None
+                            ) -> tuple[TransitionCarry, Transition]:
             # Select action
-            rng, _rng = jax.random.split(aeon_carry.rng)
-            pi, value = self.actor_critic.apply(aeon_carry.train_state.params,
-                                                aeon_carry.last_obs)
+            rng, _rng = jax.random.split(transition_carry.rng)
+            pi, value = self.actor_critic.apply(train_state.params,
+                                                transition_carry.last_observation)
             action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
             log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
 
             # Step env
             rng, _rng = jax.random.split(rng)
             rng_step = jax.random.split(_rng, foo_config.n_envs)
-            obsv, env_state, reward, done, info = jax.vmap(
+            observation, env_state, reward, done, info = jax.vmap(
                 self.env.step, in_axes=(0, 0, 0, None)
-            )(rng_step, aeon_carry.env_state, action, self.env_params)
+            )(rng_step, transition_carry.env_state, action, self.env_params)
             transition = Transition(
-                done, action, value, reward, log_prob, aeon_carry.last_obs, info
+                done, action, value, reward, log_prob, transition_carry.last_observation, info
             )
             return (
-                AeonCarry(train_state=aeon_carry.train_state, env_state=env_state,
-                          last_obs=obsv, rng=rng),
+                TransitionCarry(env_state=env_state,
+                                     last_observation=observation,
+                                     rng=rng),
                 transition,
             )
 
-        aeon_carry, batched_transition = jax.lax.scan(
-            make_transition, aeon_carry, None, foo_config.n_steps
+        make_transition_rng, reset_rng = jax.random.split(rng, 2)
+        reset_rngs = jax.random.split(reset_rng, foo_config.n_envs)
+        last_observation, env_state = self._vmapped_reset(reset_rngs, self.env_params)
+
+        transition_carry, batched_transition = jax.lax.scan(
+            make_transition,
+            TransitionCarry(
+                env_state=env_state,
+                last_observation=last_observation,
+                rng=make_transition_rng,
+            ),
+            None,
+            foo_config.n_steps,
         )
 
+        return last_observation, batched_transition
 
-        # Calculate advantage
+
+
+    def train_aeon(self, aeon_carry: AeonCarry, unused: None) -> tuple[AeonCarry, dict]:
+
+        rng, transition_rng = jax.random.split(aeon_carry.rng)
+        last_observation, batched_transition = self.make_transitions(transition_rng,
+                                                                     aeon_carry.train_state)
+
         _, last_val = self.actor_critic.apply(aeon_carry.train_state.params,
-                                              aeon_carry.last_obs)
-
+                                              last_observation)
 
         advantages, targets = calculate_gae(batched_transition, last_val)
 
@@ -352,7 +383,7 @@ class Trainer:
 
         epoch_carry = EpochCarry(train_state=aeon_carry.train_state,
                                  batched_transition=batched_transition,
-                                 advantages=advantages, targets=targets, rng=aeon_carry.rng)
+                                 advantages=advantages, targets=targets, rng=rng)
         epoch_carry, loss_info = jax.lax.scan(
             train_epoch, epoch_carry, None, foo_config.n_epochs_per_aeon
         )
@@ -366,9 +397,7 @@ class Trainer:
             jax.debug.callback(callback, metric)
 
         return (
-            AeonCarry(
-                train_state=epoch_carry.train_state, env_state=aeon_carry.env_state,
-                last_obs=aeon_carry.last_obs, rng=epoch_carry.rng),
+            AeonCarry(train_state=epoch_carry.train_state, rng=epoch_carry.rng),
             metric,
         )
 
@@ -395,12 +424,7 @@ class Trainer:
         )
 
         rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, foo_config.n_envs)
-        obsv, env_state = jax.vmap(self.env.reset, in_axes=(0, None))(reset_rng, self.env_params)
-
-        rng, _rng = jax.random.split(rng)
-        aeon_carry = AeonCarry(train_state=train_state, env_state=env_state, last_obs=obsv,
-                                 rng=_rng)
+        aeon_carry = AeonCarry(train_state=train_state, rng=_rng)
         aeon_carry, metric = jax.lax.scan(
             self.train_aeon, aeon_carry, None, foo_config.n_aeons
         )
