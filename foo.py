@@ -96,8 +96,10 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
+
+
 @flax.struct.dataclass
-class AeonState:
+class AeonBaton:
     train_state: flax.training.train_state.TrainState
     env_state: EnvState
     last_obs: jnp.ndarray
@@ -105,7 +107,7 @@ class AeonState:
 
 
 @flax.struct.dataclass
-class EpochState:
+class EpochBaton:
     train_state: flax.training.train_state.TrainState
     batched_transition: Transition # It's actually a stacked transition
     advantages: jnp.ndarray
@@ -266,14 +268,14 @@ class Trainer:
         )
 
 
-    def train_aeon(self, aeon_state: AeonState, unused: None) -> tuple[AeonState, dict]:
+    def train_aeon(self, aeon_baton: AeonBaton, unused: None) -> tuple[AeonBaton, dict]:
         # Collect trajectories
-        def env_step(aeon_state: aeon_state, unused: None) -> tuple[AeonState,
+        def make_transition(aeon_baton: aeon_baton, unused: None) -> tuple[AeonBaton,
                                                                     Transition]:
             # Select action
-            rng, _rng = jax.random.split(aeon_state.rng)
-            pi, value = self.actor_critic.apply(aeon_state.train_state.params,
-                                                aeon_state.last_obs)
+            rng, _rng = jax.random.split(aeon_baton.rng)
+            pi, value = self.actor_critic.apply(aeon_baton.train_state.params,
+                                                aeon_baton.last_obs)
             action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
             log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
 
@@ -282,29 +284,29 @@ class Trainer:
             rng_step = jax.random.split(_rng, foo_config.n_envs)
             obsv, env_state, reward, done, info = jax.vmap(
                 self.env.step, in_axes=(0, 0, 0, None)
-            )(rng_step, aeon_state.env_state, action, self.env_params)
+            )(rng_step, aeon_baton.env_state, action, self.env_params)
             transition = Transition(
-                done, action, value, reward, log_prob, aeon_state.last_obs, info
+                done, action, value, reward, log_prob, aeon_baton.last_obs, info
             )
             return (
-                AeonState(train_state=aeon_state.train_state, env_state=env_state,
+                AeonBaton(train_state=aeon_baton.train_state, env_state=env_state,
                           last_obs=obsv, rng=rng),
                 transition,
             )
 
-        aeon_state, batched_transition = jax.lax.scan(
-            env_step, aeon_state, None, foo_config.n_steps
+        aeon_baton, batched_transition = jax.lax.scan(
+            make_transition, aeon_baton, None, foo_config.n_steps
         )
 
 
         # Calculate advantage
-        _, last_val = self.actor_critic.apply(aeon_state.train_state.params,
-                                              aeon_state.last_obs)
+        _, last_val = self.actor_critic.apply(aeon_baton.train_state.params,
+                                              aeon_baton.last_obs)
 
 
         advantages, targets = calculate_gae(batched_transition, last_val)
 
-        def train_epoch(epoch_state: EpochState, unused: None) -> tuple[EpochState, None]:
+        def train_epoch(epoch_baton: EpochBaton, unused: None) -> tuple[EpochBaton, None]:
             def train_minibatch(train_state, batch_info):
                 batched_transition, advantages, targets = batch_info
 
@@ -318,10 +320,10 @@ class Trainer:
                 train_state = train_state.apply_gradients(grads=grads)
                 return train_state, total_loss
 
-            rng, _rng = jax.random.split(epoch_state.rng)
+            rng, _rng = jax.random.split(epoch_baton.rng)
             permutation = jax.random.permutation(_rng, foo_config.batch_size)
-            batch = (epoch_state.batched_transition, epoch_state.advantages,
-                     epoch_state.targets)
+            batch = (epoch_baton.batched_transition, epoch_baton.advantages,
+                     epoch_baton.targets)
             batch = jax.tree_util.tree_map(
                 lambda x: x.reshape((foo_config.batch_size,) + x.shape[2:]), batch
             )
@@ -335,12 +337,12 @@ class Trainer:
                 shuffled_batch,
             )
             train_state, total_loss = jax.lax.scan(
-                train_minibatch, epoch_state.train_state, minibatches
+                train_minibatch, epoch_baton.train_state, minibatches
             )
             return (
-                EpochState(train_state=train_state,
-                            batched_transition=epoch_state.batched_transition,
-                            advantages=epoch_state.advantages, targets=epoch_state.targets,
+                EpochBaton(train_state=train_state,
+                            batched_transition=epoch_baton.batched_transition,
+                            advantages=epoch_baton.advantages, targets=epoch_baton.targets,
                             rng=rng),
                 total_loss
             )
@@ -348,11 +350,11 @@ class Trainer:
         # End of train_epoch, continuing train_aeon
 
 
-        epoch_state = EpochState(train_state=aeon_state.train_state,
-                                  batched_transition=batched_transition,
-                                  advantages=advantages, targets=targets, rng=aeon_state.rng)
-        epoch_state, loss_info = jax.lax.scan(
-            train_epoch, epoch_state, None, foo_config.n_epochs_per_aeon
+        epoch_baton = EpochBaton(train_state=aeon_baton.train_state,
+                                 batched_transition=batched_transition,
+                                 advantages=advantages, targets=targets, rng=aeon_baton.rng)
+        epoch_baton, loss_info = jax.lax.scan(
+            train_epoch, epoch_baton, None, foo_config.n_epochs_per_aeon
         )
         metric = batched_transition.info
         if foo_config.debug:
@@ -364,9 +366,9 @@ class Trainer:
             jax.debug.callback(callback, metric)
 
         return (
-            AeonState(
-                train_state=epoch_state.train_state, env_state=aeon_state.env_state,
-                last_obs=aeon_state.last_obs, rng=aeon_state.rng),
+            AeonBaton(
+                train_state=epoch_baton.train_state, env_state=aeon_baton.env_state,
+                last_obs=aeon_baton.last_obs, rng=epoch_baton.rng),
             metric,
         )
 
@@ -397,12 +399,12 @@ class Trainer:
         obsv, env_state = jax.vmap(self.env.reset, in_axes=(0, None))(reset_rng, self.env_params)
 
         rng, _rng = jax.random.split(rng)
-        aeon_state = AeonState(train_state=train_state, env_state=env_state, last_obs=obsv,
+        aeon_baton = AeonBaton(train_state=train_state, env_state=env_state, last_obs=obsv,
                                  rng=_rng)
-        aeon_state, metric = jax.lax.scan(
-            self.train_aeon, aeon_state, None, foo_config.n_aeons
+        aeon_baton, metric = jax.lax.scan(
+            self.train_aeon, aeon_baton, None, foo_config.n_aeons
         )
-        return {'aeon_state': aeon_state, 'metrics': metric}
+        return {'aeon_baton': aeon_baton, 'metrics': metric}
 
 
 
