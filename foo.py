@@ -145,17 +145,96 @@ class ActorCritic(flax.linen.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
+@flax.struct.dataclass
 class LinearSchedule:
-    def __init__(self, foo_config: FooConfig) -> None:
-        self.foo_config = foo_config
+    num_minibatches: int
+    update_epochs: int
+    num_updates: int
+    lr: float
+
+    @staticmethod
+    def from_foo_config(foo_config: FooConfig) -> LinearSchedule:
+        return LinearSchedule(
+            num_minibatches=foo_config.num_minibatches,
+            update_epochs=foo_config.update_epochs,
+            num_updates=foo_config.num_updates,
+            lr=foo_config.lr,
+        )
+
 
     def __call__(self, count: int) -> RealNumber:
         frac = (
             1.0
-            - (count // (self.foo_config.num_minibatches * self.foo_config.update_epochs))
-            / self.foo_config.num_updates
+            - (count // (self.num_minibatches * self.update_epochs))
+            / self.num_updates
         )
-        return self.foo_config.lr * frac
+        return self.lr * frac
+
+
+def loss_function(actor_critic: ActorCritic, params: dict, traj_batch: Transition,
+                  gae: jnp.ndarray, targets: jnp.ndarray
+                  ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
+    # Rerun actor_critic
+    pi, value = actor_critic.apply(params, traj_batch.obs)
+    log_prob = pi.log_prob(traj_batch.action)
+
+    # calculate value loss
+    value_pred_clipped = traj_batch.value + (
+        value - traj_batch.value
+    ).clip(-foo_config.clip_eps, foo_config.clip_eps)
+    value_losses = jnp.square(value - targets)
+    value_losses_clipped = jnp.square(value_pred_clipped - targets)
+    value_loss = (
+        0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+    )
+
+    # Calculate actor loss
+    ratio = jnp.exp(log_prob - traj_batch.log_prob)
+    gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+    loss_actor1 = ratio * gae
+    loss_actor2 = (
+        jnp.clip(
+            ratio,
+            1.0 - foo_config.clip_eps,
+            1.0 + foo_config.clip_eps,
+        )
+        * gae
+    )
+    loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+    loss_actor = loss_actor.mean()
+    entropy = pi.entropy().mean()
+
+    total_loss = (
+        loss_actor
+        + foo_config.vf_coef * value_loss
+        - foo_config.ent_coef * entropy
+    )
+    return total_loss, (value_loss, loss_actor, entropy)
+
+
+def calculate_gae(traj_batch, last_val):
+    def get_advantages(gae_and_next_value, transition):
+        gae, next_value = gae_and_next_value
+        done, value, reward = (
+            transition.done,
+            transition.value,
+            transition.reward,
+        )
+        delta = reward + foo_config.gamma * next_value * (1 - done) - value
+        gae = (
+            delta
+            + foo_config.gamma * foo_config.gae_lambda * (1 - done) * gae
+        )
+        return (gae, value), gae
+
+    _, advantages = jax.lax.scan(
+        get_advantages,
+        (jnp.zeros_like(last_val), last_val),
+        traj_batch,
+        reverse=True,
+        unroll=16,
+    )
+    return advantages, advantages + traj_batch.value
 
 
 def make_train(foo_config: FooConfig):
@@ -167,18 +246,18 @@ def make_train(foo_config: FooConfig):
         '''
         return runner_state, metric
         '''
-        # Init network
+        # Init actor_critic
         rng = foo_config.rng
-        network = ActorCritic(
+        actor_critic = ActorCritic(
             env.action_space(env_params).n, activation=foo_config.activation
         )
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
-        network_params = network.init(_rng, init_x)
+        actor_critic_params = actor_critic.init(_rng, init_x)
         if foo_config.anneal_lr:
             tx = optax.chain(
                 optax.clip_by_global_norm(foo_config.max_grad_norm),
-                optax.adam(learning_rate=LinearSchedule(foo_config), eps=1e-5),
+                optax.adam(learning_rate=LinearSchedule.from_foo_config(foo_config), eps=1e-5),
             )
         else:
             tx = optax.chain(
@@ -186,8 +265,8 @@ def make_train(foo_config: FooConfig):
                 optax.adam(foo_config.lr, eps=1e-5),
             )
         train_state = flax.training.train_state.TrainState.create(
-            apply_fn=network.apply,
-            params=network_params,
+            apply_fn=actor_critic.apply,
+            params=actor_critic_params,
             tx=tx,
         )
 
@@ -202,7 +281,7 @@ def make_train(foo_config: FooConfig):
                                                                              Transition]:
                 # Select action
                 rng, _rng = jax.random.split(runner_state.rng)
-                pi, value = network.apply(runner_state.train_state.params, runner_state.last_obs)
+                pi, value = actor_critic.apply(runner_state.train_state.params, runner_state.last_obs)
                 action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
                 log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
                 # breakpoint()
@@ -228,81 +307,18 @@ def make_train(foo_config: FooConfig):
 
 
             # Calculate advantage
-            _, last_val = network.apply(runner_state.train_state.params, runner_state.last_obs)
+            _, last_val = actor_critic.apply(runner_state.train_state.params, runner_state.last_obs)
 
-            def _calculate_gae(traj_batch, last_val):
-                def _get_advantages(gae_and_next_value, transition):
-                    gae, next_value = gae_and_next_value
-                    done, value, reward = (
-                        transition.done,
-                        transition.value,
-                        transition.reward,
-                    )
-                    delta = reward + foo_config.gamma * next_value * (1 - done) - value
-                    gae = (
-                        delta
-                        + foo_config.gamma * foo_config.gae_lambda * (1 - done) * gae
-                    )
-                    return (gae, value), gae
 
-                _, advantages = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16,
-                )
-                return advantages, advantages + traj_batch.value
+            advantages, targets = calculate_gae(traj_batch, last_val)
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
-
-            # Update network
+            # Update actor_critic
             def _update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
                 def _update_minibatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
 
-                    def _loss_function(params, traj_batch, gae, targets):
-                        # Rerun network
-                        pi, value = network.apply(params, traj_batch.obs)
-                        log_prob = pi.log_prob(traj_batch.action)
-
-                        # calculate value loss
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
-                        ).clip(-foo_config.clip_eps, foo_config.clip_eps)
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = (
-                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-                        )
-
-                        # Calculate actor loss
-                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
-                        loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - foo_config.clip_eps,
-                                1.0 + foo_config.clip_eps,
-                            )
-                            * gae
-                        )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
-
-                        total_loss = (
-                            loss_actor
-                            + foo_config.vf_coef * value_loss
-                            - foo_config.ent_coef * entropy
-                        )
-                        return total_loss, (value_loss, loss_actor, entropy)
-
-                    # End of _loss_function, continuing _update_minibatch
-
-
-                    grad_fn = jax.value_and_grad(_loss_function, has_aux=True)
+                    grad_fn = jax.value_and_grad(lambda *args: loss_function(actor_critic, *args),
+                                                 has_aux=True)
                     total_loss, grads = grad_fn(
                         train_state.params, traj_batch, advantages, targets
                     )
