@@ -18,7 +18,8 @@ import gymnax
 import purejaxrl.wrappers
 
 RealNumber = int | float
-EnvState = TypeVar('EnvState')
+EnvState = TypeVar('EnvState') # This is a different class for each environment, but often this will
+                               # actually be `purejaxrl.wrappers.LogEnvState`.
 sys.breakpointhook = jax.debug.breakpoint
 
 
@@ -243,6 +244,8 @@ class Trainer:
     def __init__(self, foo_config: FooConfig) -> None:
         self.foo_config = foo_config
         raw_env, self.env_params = gymnax.make(foo_config.env_name)
+        # self.env_params is an immutable `EnvParams` object with constants for the environment,
+        # like the gravity constant.
         self.env = purejaxrl.wrappers.LogWrapper(
             purejaxrl.wrappers.FlattenObservationWrapper(raw_env)
         )
@@ -251,10 +254,10 @@ class Trainer:
         )
 
 
-    def _update_step(self, runner_state: RunnerState, unused: None):
+    def _update_step(self, runner_state: RunnerState, unused: None) -> tuple[RunnerState, dict]:
         # Collect trajectories
         def env_step(runner_state: runner_state, unused: None) -> tuple[RunnerState,
-                                                                         Transition]:
+                                                                        Transition]:
             # Select action
             rng, _rng = jax.random.split(runner_state.rng)
             pi, value = self.actor_critic.apply(runner_state.train_state.params,
