@@ -239,17 +239,23 @@ def calculate_gae(batched_transition: Transition, last_val: jnp.ndarray) -> tupl
     return advantages, advantages + batched_transition.value
 
 
-def make_train(foo_config: FooConfig):
-    env, env_params = gymnax.make(foo_config.env_name)
-    env = purejaxrl.wrappers.FlattenObservationWrapper(env)
-    env = purejaxrl.wrappers.LogWrapper(env)
 
-    def train(rng: jax.random.PRNGKey) -> tuple[RunnerState, dict]:
+class Trainer:
+    def __init__(self, foo_config: FooConfig) -> None:
+        self.foo_config = foo_config
+        raw_env, self.env_params = gymnax.make(foo_config.env_name)
+        self.env = purejaxrl.wrappers.LogWrapper(
+            purejaxrl.wrappers.FlattenObservationWrapper(raw_env)
+        )
+
+
+
+    def __call__(self, rng: jax.random.PRNGKey):
         actor_critic = ActorCritic(
-            env.action_space(env_params).n, activation=foo_config.activation
+            self.env.action_space(self.env_params).n, activation=foo_config.activation
         )
         rng, _rng = jax.random.split(foo_config.rng)
-        init_x = jnp.zeros(env.observation_space(env_params).shape)
+        init_x = jnp.zeros(self.env.observation_space(self.env_params).shape)
         actor_critic_params = actor_critic.init(_rng, init_x)
         if foo_config.anneal_lr:
             tx = optax.chain(
@@ -269,7 +275,7 @@ def make_train(foo_config: FooConfig):
 
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, foo_config.num_envs)
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        obsv, env_state = jax.vmap(self.env.reset, in_axes=(0, None))(reset_rng, self.env_params)
 
         # Train loop
         def update_step(runner_state: RunnerState, unused: None):
@@ -286,8 +292,8 @@ def make_train(foo_config: FooConfig):
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, foo_config.num_envs)
                 obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, runner_state.env_state, action, env_params)
+                    self.env.step, in_axes=(0, 0, 0, None)
+                )(rng_step, runner_state.env_state, action, self.env_params)
                 transition = Transition(
                     done, action, value, reward, log_prob, runner_state.last_obs, info
                 )
@@ -389,13 +395,9 @@ def make_train(foo_config: FooConfig):
         )
         return {'runner_state': runner_state, 'metrics': metric}
 
-    # End of train, continuing make_train
-
-    return train
-
 
 
 if __name__ == '__main__':
     foo_config = FooConfig()
-    train_jit = jax.jit(make_train(foo_config))
+    train_jit = jax.jit(Trainer(foo_config))
     out = train_jit(foo_config.rng)
