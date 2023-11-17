@@ -145,18 +145,23 @@ class ActorCritic(flax.linen.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
+class LinearSchedule:
+    def __init__(self, foo_config: FooConfig) -> None:
+        self.foo_config = foo_config
+
+    def __call__(self, count: int) -> RealNumber:
+        frac = (
+            1.0
+            - (count // (self.foo_config.num_minibatches * self.foo_config.update_epochs))
+            / self.foo_config.num_updates
+        )
+        return self.foo_config.lr * frac
+
+
 def make_train(foo_config: FooConfig):
     env, env_params = gymnax.make(foo_config.env_name)
     env = purejaxrl.wrappers.FlattenObservationWrapper(env)
     env = purejaxrl.wrappers.LogWrapper(env)
-
-    def linear_schedule(count: int) -> RealNumber:
-        frac = (
-            1.0
-            - (count // (foo_config.num_minibatches * foo_config.update_epochs))
-            / foo_config.num_updates
-        )
-        return foo_config.lr * frac
 
     def train(rng: jax.random.PRNGKey) -> tuple[RunnerState, dict]:
         '''
@@ -173,7 +178,7 @@ def make_train(foo_config: FooConfig):
         if foo_config.anneal_lr:
             tx = optax.chain(
                 optax.clip_by_global_norm(foo_config.max_grad_norm),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                optax.adam(learning_rate=LinearSchedule(foo_config), eps=1e-5),
             )
         else:
             tx = optax.chain(
