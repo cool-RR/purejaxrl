@@ -239,7 +239,6 @@ def calculate_gae(batched_transition: Transition, last_val: jnp.ndarray) -> tupl
     return advantages, advantages + batched_transition.value
 
 
-
 class Trainer:
     def __init__(self, foo_config: FooConfig) -> None:
         self.foo_config = foo_config
@@ -247,16 +246,14 @@ class Trainer:
         self.env = purejaxrl.wrappers.LogWrapper(
             purejaxrl.wrappers.FlattenObservationWrapper(raw_env)
         )
-
-
-
-    def __call__(self, rng: jax.random.PRNGKey):
-        actor_critic = ActorCritic(
+        self.actor_critic = ActorCritic(
             self.env.action_space(self.env_params).n, activation=foo_config.activation
         )
-        rng, _rng = jax.random.split(foo_config.rng)
+
+    def __call__(self):
+        rng, _rng = jax.random.split(self.foo_config.rng)
         init_x = jnp.zeros(self.env.observation_space(self.env_params).shape)
-        actor_critic_params = actor_critic.init(_rng, init_x)
+        actor_critic_params = self.actor_critic.init(_rng, init_x)
         if foo_config.anneal_lr:
             tx = optax.chain(
                 optax.clip_by_global_norm(foo_config.max_grad_norm),
@@ -268,7 +265,7 @@ class Trainer:
                 optax.adam(foo_config.lr, eps=1e-5),
             )
         train_state = flax.training.train_state.TrainState.create(
-            apply_fn=actor_critic.apply,
+            apply_fn=self.actor_critic.apply,
             params=actor_critic_params,
             tx=tx,
         )
@@ -284,7 +281,8 @@ class Trainer:
                                                                              Transition]:
                 # Select action
                 rng, _rng = jax.random.split(runner_state.rng)
-                pi, value = actor_critic.apply(runner_state.train_state.params, runner_state.last_obs)
+                pi, value = self.actor_critic.apply(runner_state.train_state.params,
+                                                    runner_state.last_obs)
                 action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
                 log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
 
@@ -309,18 +307,21 @@ class Trainer:
 
 
             # Calculate advantage
-            _, last_val = actor_critic.apply(runner_state.train_state.params, runner_state.last_obs)
+            _, last_val = self.actor_critic.apply(runner_state.train_state.params,
+                                                  runner_state.last_obs)
 
 
             advantages, targets = calculate_gae(batched_transition, last_val)
 
-            # Update actor_critic
+            # Update self.actor_critic
             def update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
                 def update_minibatch(train_state, batch_info):
                     batched_transition, advantages, targets = batch_info
 
-                    grad_fn = jax.value_and_grad(lambda *args: loss_function(actor_critic, *args),
-                                                 has_aux=True)
+                    grad_fn = jax.value_and_grad(
+                        lambda *args: loss_function(self.actor_critic, *args),
+                        has_aux=True
+                    )
                     total_loss, grads = grad_fn(
                         train_state.params, batched_transition, advantages, targets
                     )
@@ -385,7 +386,9 @@ class Trainer:
                 metric,
             )
 
-        # End of _update_step, continuing train
+
+
+
 
         rng, _rng = jax.random.split(rng)
         runner_state = RunnerState(train_state=train_state, env_state=env_state, last_obs=obsv,
@@ -400,4 +403,4 @@ class Trainer:
 if __name__ == '__main__':
     foo_config = FooConfig()
     train_jit = jax.jit(Trainer(foo_config))
-    out = train_jit(foo_config.rng)
+    out = train_jit()
