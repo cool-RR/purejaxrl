@@ -30,7 +30,7 @@ class FooConfig:
     num_envs: int = 4
     num_steps: int = 128
     total_timesteps: float = 3e5
-    update_epochs: int = 4
+    n_epochs_per_aeon: int = 4
     num_minibatches: int = 4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -51,7 +51,7 @@ class FooConfig:
 
     @property
     @functools.cache
-    def num_updates(self) -> int:
+    def n_aeons(self) -> int:
         return self.total_timesteps // self.num_steps // self.num_envs
 
     @property
@@ -149,16 +149,16 @@ class ActorCritic(flax.linen.Module):
 @flax.struct.dataclass
 class LinearSchedule:
     num_minibatches: int
-    update_epochs: int
-    num_updates: int
+    n_epochs_per_aeon: int
+    n_aeons: int
     lr: float
 
     @staticmethod
     def from_foo_config(foo_config: FooConfig) -> LinearSchedule:
         return LinearSchedule(
             num_minibatches=foo_config.num_minibatches,
-            update_epochs=foo_config.update_epochs,
-            num_updates=foo_config.num_updates,
+            n_epochs_per_aeon=foo_config.n_epochs_per_aeon,
+            n_aeons=foo_config.n_aeons,
             lr=foo_config.lr,
         )
 
@@ -166,8 +166,8 @@ class LinearSchedule:
     def __call__(self, count: int) -> RealNumber:
         frac = (
             1.0
-            - (count // (self.num_minibatches * self.update_epochs))
-            / self.num_updates
+            - (count // (self.num_minibatches * self.n_epochs_per_aeon))
+            / self.n_aeons
         )
         return self.lr * frac
 
@@ -218,17 +218,10 @@ def calculate_gae(batched_transition: Transition, last_val: jnp.ndarray) -> tupl
     def get_advantages(gae_and_next_value: tuple[jnp.ndarray, jnp.ndarray], transition: Transition
                        ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
         next_gae, next_value = gae_and_next_value
-        done, value, reward = (
-            transition.done,
-            transition.value,
-            transition.reward,
-        )
-        delta = reward + foo_config.gamma * next_value * (1 - done) - value
-        gae = (
-            delta +
-            foo_config.gamma * foo_config.gae_lambda * (1 - done) * next_gae
-        )
-        return (gae, value), gae
+        discounted_next_value = foo_config.gamma * next_value * (1 - transition.done)
+        delta = transition.reward + discounted_next_value - transition.value
+        gae = delta + (foo_config.gamma * foo_config.gae_lambda * (1 - transition.done) * next_gae)
+        return (gae, transition.value), gae
 
     _, advantages = jax.lax.scan(
         get_advantages,
@@ -254,7 +247,7 @@ class Trainer:
         )
 
 
-    def _update_step(self, runner_state: RunnerState, unused: None) -> tuple[RunnerState, dict]:
+    def train_aeon(self, runner_state: RunnerState, unused: None) -> tuple[RunnerState, dict]:
         # Collect trajectories
         def env_step(runner_state: runner_state, unused: None) -> tuple[RunnerState,
                                                                         Transition]:
@@ -292,9 +285,8 @@ class Trainer:
 
         advantages, targets = calculate_gae(batched_transition, last_val)
 
-        # Update self.actor_critic
-        def update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
-            def update_minibatch(train_state, batch_info):
+        def train_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
+            def train_minibatch(train_state, batch_info):
                 batched_transition, advantages, targets = batch_info
 
                 grad_fn = jax.value_and_grad(
@@ -306,8 +298,6 @@ class Trainer:
                 )
                 train_state = train_state.apply_gradients(grads=grads)
                 return train_state, total_loss
-
-            # End of _update_minibatch, continuing _update_epoch
 
             rng, _rng = jax.random.split(update_state.rng)
             batch_size = foo_config.minibatch_size * foo_config.num_minibatches
@@ -330,7 +320,7 @@ class Trainer:
                 shuffled_batch,
             )
             train_state, total_loss = jax.lax.scan(
-                update_minibatch, update_state.train_state, minibatches
+                train_minibatch, update_state.train_state, minibatches
             )
             return (
                 UpdateState(train_state=train_state,
@@ -340,14 +330,14 @@ class Trainer:
                 total_loss
             )
 
-        # End of _update_epoch, continuing _update_step
+        # End of train_epoch, continuing train_aeon
 
 
         update_state = UpdateState(train_state=runner_state.train_state,
                                    batched_transition=batched_transition,
                                    advantages=advantages, targets=targets, rng=runner_state.rng)
         update_state, loss_info = jax.lax.scan(
-            update_epoch, update_state, None, foo_config.update_epochs
+            train_epoch, update_state, None, foo_config.n_epochs_per_aeon
         )
         metric = batched_transition.info
         if foo_config.debug:
@@ -395,7 +385,7 @@ class Trainer:
         runner_state = RunnerState(train_state=train_state, env_state=env_state, last_obs=obsv,
                                    rng=_rng)
         runner_state, metric = jax.lax.scan(
-            self._update_step, runner_state, None, foo_config.num_updates
+            self.train_aeon, runner_state, None, foo_config.n_aeons
         )
         return {'runner_state': runner_state, 'metrics': metric}
 
