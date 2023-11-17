@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Sequence, NamedTuple, Any, TypeVar
 import dataclasses
 import functools
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +19,8 @@ import purejaxrl.wrappers
 
 RealNumber = int | float
 EnvState = TypeVar('EnvState')
+sys.breakpointhook = jax.debug.breakpoint
+
 
 @dataclasses.dataclass(kw_only=True, repr=False)
 class FooConfig:
@@ -50,6 +53,16 @@ class FooConfig:
         )
 
 
+class Transition(NamedTuple):
+    done: jnp.ndarray
+    action: jnp.ndarray
+    value: jnp.ndarray
+    reward: jnp.ndarray
+    log_prob: jnp.ndarray
+    obs: jnp.ndarray
+    info: jnp.ndarray
+
+
 @flax.struct.dataclass
 class RunnerState:
     train_state: flax.training.train_state.TrainState
@@ -57,6 +70,14 @@ class RunnerState:
     last_obs: jnp.ndarray
     rng: jax.random.PRNGKey
 
+
+@flax.struct.dataclass
+class UpdateState:
+    train_state: flax.training.train_state.TrainState
+    traj_batch: Transition # It's actually a stacked transition
+    advantages: jnp.ndarray
+    targets: jnp.ndarray
+    rng: jax.random.PRNGKey
 
 
 
@@ -109,16 +130,6 @@ class ActorCritic(flax.linen.Module):
 
 
         return pi, jnp.squeeze(critic, axis=-1)
-
-
-class Transition(NamedTuple):
-    done: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    reward: jnp.ndarray
-    log_prob: jnp.ndarray
-    obs: jnp.ndarray
-    info: jnp.ndarray
 
 
 def make_train(foo_config: FooConfig):
@@ -182,7 +193,7 @@ def make_train(foo_config: FooConfig):
                 pi, value = network.apply(runner_state.train_state.params, runner_state.last_obs)
                 action = pi.sample(seed=_rng) # E.g. array([0, 1, 0, 1])
                 log_prob = pi.log_prob(action) # E.g. array([-0.1, -0.2, -0.4, -0.2], dtype=float32)
-                # jax.debug.breakpoint()
+                # breakpoint()
 
                 # Step env
                 rng, _rng = jax.random.split(rng)
@@ -202,6 +213,7 @@ def make_train(foo_config: FooConfig):
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, foo_config.num_steps
             )
+
 
             # Calculate advantage
             _, last_val = network.apply(runner_state.train_state.params, runner_state.last_obs)
@@ -233,7 +245,7 @@ def make_train(foo_config: FooConfig):
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
             # Update network
-            def _update_epoch(update_state, unused):
+            def _update_epoch(update_state: UpdateState, unused: None) -> tuple[UpdateState, None]:
                 def _update_minibatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
 
@@ -287,14 +299,13 @@ def make_train(foo_config: FooConfig):
 
                 # End of _update_minibatch, continuing _update_epoch
 
-                train_state, traj_batch, advantages, targets, rng = update_state
-                rng, _rng = jax.random.split(rng)
+                rng, _rng = jax.random.split(update_state.rng)
                 batch_size = foo_config.minibatch_size * foo_config.num_minibatches
                 assert (
                     batch_size == foo_config.num_steps * foo_config.num_envs
                 ), 'batch size must be equal to number of steps * number of envs'
                 permutation = jax.random.permutation(_rng, batch_size)
-                batch = (traj_batch, advantages, targets)
+                batch = (update_state.traj_batch, update_state.advantages, update_state.targets)
                 batch = jax.tree_util.tree_map(
                     lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
                 )
@@ -308,22 +319,24 @@ def make_train(foo_config: FooConfig):
                     shuffled_batch,
                 )
                 train_state, total_loss = jax.lax.scan(
-                    _update_minibatch, train_state, minibatches
+                    _update_minibatch, update_state.train_state, minibatches
                 )
-                update_state = (train_state, traj_batch, advantages, targets, rng)
-                return update_state, total_loss
+                return (
+                    UpdateState(train_state=train_state, traj_batch=update_state.traj_batch,
+                                advantages=update_state.advantages, targets=update_state.targets,
+                                rng=rng),
+                    total_loss
+                )
 
             # End of _update_epoch, continuing _update_step
 
 
-            update_state = (runner_state.train_state, traj_batch, advantages, targets,
-                            runner_state.rng)
+            update_state = UpdateState(train_state=runner_state.train_state, traj_batch=traj_batch,
+                                       advantages=advantages, targets=targets, rng=runner_state.rng)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, foo_config.update_epochs
             )
-            train_state = update_state[0]
             metric = traj_batch.info
-            rng = update_state[-1]
             if foo_config.debug:
                 def callback(info):
                     return_values = info['returned_episode_returns'][info['returned_episode']]
@@ -334,8 +347,8 @@ def make_train(foo_config: FooConfig):
 
             return (
                 RunnerState(
-                    train_state=train_state, env_state=runner_state.env_state,
-                    last_obs=runner_state.last_obs, rng=runner_state.rng),
+                    train_state=update_state.train_state, env_state=runner_state.env_state,
+                    last_obs=runner_state.last_obs, rng=update_state.rng),
                 metric,
             )
 
@@ -344,7 +357,7 @@ def make_train(foo_config: FooConfig):
         rng, _rng = jax.random.split(rng)
         runner_state = RunnerState(train_state=train_state, env_state=env_state, last_obs=obsv,
                                    rng=_rng)
-        # jax.debug.breakpoint()
+        # breakpoint()
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, foo_config.num_updates
         )
