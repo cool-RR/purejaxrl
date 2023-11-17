@@ -22,7 +22,8 @@ EnvState = TypeVar('EnvState')
 sys.breakpointhook = jax.debug.breakpoint
 
 
-@dataclasses.dataclass(kw_only=True, repr=False)
+# @dataclasses.dataclass(kw_only=True, repr=False)
+@flax.struct.dataclass
 class FooConfig:
     lr: float = 2.5e-4
     num_envs: int = 4
@@ -42,8 +43,20 @@ class FooConfig:
     debug: bool = True
     rng_key: int = 30
 
-    def __post_init__(self) -> None:
-        self.rng = jax.random.PRNGKey(self.rng_key)
+    @property
+    @functools.cache
+    def rng(self) -> jax.random.PRNGKey:
+        return jax.random.PRNGKey(self.rng_key)
+
+    @property
+    @functools.cache
+    def num_updates(self) -> int:
+        return self.total_timesteps // self.num_steps // self.num_envs
+
+    @property
+    @functools.cache
+    def minibatch_size(self) -> int:
+        return self.num_envs * self.num_steps // self.num_minibatches
 
 
     def __hash__(self) -> int:
@@ -133,12 +146,6 @@ class ActorCritic(flax.linen.Module):
 
 
 def make_train(foo_config: FooConfig):
-    foo_config.num_updates = (
-        foo_config.total_timesteps // foo_config.num_steps // foo_config.num_envs
-    )
-    foo_config.minibatch_size = (
-        foo_config.num_envs * foo_config.num_steps // foo_config.num_minibatches
-    )
     env, env_params = gymnax.make(foo_config.env_name)
     env = purejaxrl.wrappers.FlattenObservationWrapper(env)
     env = purejaxrl.wrappers.LogWrapper(env)
